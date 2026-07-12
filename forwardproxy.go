@@ -65,6 +65,11 @@ type Handler struct {
 	// If true, the Via header will not be added.
 	HideVia bool `json:"hide_via,omitempty"`
 
+	// If true, the client's Proxy-Authorization header will not be forwarded
+	// to the upstream proxy. By default it is forwarded so that an upstream
+	// (e.g. v2ray http inbound) can authenticate the client itself.
+	HideProxyAuth bool `json:"hide_proxy_auth,omitempty"`
+
 	// If true, the strict check preventing HTTP upstreams will be disabled.
 	DisableInsecureUpstreamsCheck bool `json:"disable_insecure_upstreams_check,omitempty"`
 
@@ -314,14 +319,23 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	}
 
 	ctx := context.Background()
+	ctxHeader := make(http.Header)
 	if !h.HideIP {
-		ctxHeader := make(http.Header)
 		for k, v := range r.Header {
 			if kL := strings.ToLower(k); kL == "forwarded" || kL == "x-forwarded-for" {
 				ctxHeader[k] = v
 			}
 		}
 		ctxHeader.Add("Forwarded", "for=\""+r.RemoteAddr+"\"")
+	}
+	// Forward the client's Proxy-Authorization to the upstream proxy (e.g. v2ray),
+	// so the upstream can authenticate the client itself.
+	if h.upstream != nil && !h.HideProxyAuth {
+		if pa := r.Header.Get("Proxy-Authorization"); pa != "" {
+			ctxHeader.Set("Proxy-Authorization", pa)
+		}
+	}
+	if len(ctxHeader) > 0 {
 		ctx = context.WithValue(ctx, httpclient.ContextKeyHeader{}, ctxHeader)
 	}
 
@@ -401,6 +415,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	r.ProtoMinor = 1
 	r.RequestURI = ""
 
+	// Save the client's Proxy-Authorization before removeHopByHop strips it,
+	// so we can forward it to the upstream proxy (e.g. v2ray http inbound).
+	clientProxyAuth := r.Header.Get("Proxy-Authorization")
 	removeHopByHop(r.Header)
 
 	if !h.HideIP {
@@ -444,7 +461,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			// http/https upstream: connect directly to the proxy server and send
 			// the request with WriteProxy (full URL in request line), which is
 			// what an HTTP proxy expects for plain HTTP requests.
-			if creds := h.upstream.User.String(); creds != "" {
+			// Forward the client's Proxy-Authorization to the upstream, or fall
+			// back to credentials embedded in the upstream URL.
+			if !h.HideProxyAuth && clientProxyAuth != "" {
+				r.Header.Set("Proxy-Authorization", clientProxyAuth)
+			} else if creds := h.upstream.User.String(); creds != "" {
 				r.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(creds)))
 			}
 			upsConn, err = h.upstreamHTTPDialContext(ctx, "tcp", r.URL.Host)
