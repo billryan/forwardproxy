@@ -103,6 +103,10 @@ type Handler struct {
 	dialContext func(ctx context.Context, network, address string) (net.Conn, error)
 	upstream    *url.URL // address of upstream proxy
 
+	// for http/https upstreams: dial directly to the proxy server (not via CONNECT tunnel)
+	// used to forward plain HTTP requests with WriteProxy
+	upstreamHTTPDialContext func(ctx context.Context, network, address string) (net.Conn, error)
+
 	aclRules []aclRule
 
 	// TODO: temporary/deprecated - we should try to reuse existing authentication modules instead!
@@ -237,6 +241,34 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 			// upstreamDialer does not have DialContext - ignore the context :(
 			h.dialContext = func(ctx context.Context, network string, address string) (net.Conn, error) {
 				return upstreamDialer.Dial(network, address)
+			}
+		}
+
+		// For http/https upstreams, plain HTTP requests must be forwarded directly to the
+		// proxy server (not via a CONNECT tunnel). Save a dialer that connects to the proxy
+		// host so we can use r.WriteProxy() later.
+		switch h.upstream.Scheme {
+		case "http", "https":
+			proxyHost := h.upstream.Host
+			if h.upstream.Scheme == "http" && h.upstream.Port() == "" {
+				proxyHost = net.JoinHostPort(h.upstream.Hostname(), "80")
+			} else if h.upstream.Scheme == "https" && h.upstream.Port() == "" {
+				proxyHost = net.JoinHostPort(h.upstream.Hostname(), "443")
+			}
+			if h.upstream.Scheme == "https" {
+				tlsCfg := &tls.Config{ServerName: h.upstream.Hostname(), MinVersion: tls.VersionTLS12}
+				if isLocalhost(h.upstream.Hostname()) {
+					tlsCfg.InsecureSkipVerify = true // #nosec G402
+				}
+				h.upstreamHTTPDialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+					conn, err := tls.DialWithDialer(dialer, network, proxyHost, tlsCfg)
+					return conn, err
+				}
+			} else {
+				capturedHost := proxyHost
+				h.upstreamHTTPDialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+					return dialer.DialContext(ctx, network, capturedHost)
+				}
 			}
 		}
 	}
@@ -403,20 +435,35 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		// Upstream requests don't interact well with Transport: connections could always be
 		// reused, but Transport thinks they go to different Hosts, so it spawns tons of
 		// useless connections.
-		// Just use dialContext, which will multiplex via single connection, if http/2
-		if creds := h.upstream.User.String(); creds != "" {
-			// set upstream credentials for the request, if needed
-			r.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(creds)))
-		}
 		if r.URL.Port() == "" {
 			r.URL.Host = net.JoinHostPort(r.URL.Host, "80")
 		}
-		upsConn, err := h.dialContext(ctx, "tcp", r.URL.Host)
-		if err != nil {
-			return caddyhttp.Error(http.StatusBadGateway,
-				fmt.Errorf("failed to dial upstream: %v", err))
+
+		var upsConn net.Conn
+		if h.upstreamHTTPDialContext != nil {
+			// http/https upstream: connect directly to the proxy server and send
+			// the request with WriteProxy (full URL in request line), which is
+			// what an HTTP proxy expects for plain HTTP requests.
+			if creds := h.upstream.User.String(); creds != "" {
+				r.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(creds)))
+			}
+			upsConn, err = h.upstreamHTTPDialContext(ctx, "tcp", r.URL.Host)
+			if err != nil {
+				return caddyhttp.Error(http.StatusBadGateway,
+					fmt.Errorf("failed to dial upstream: %v", err))
+			}
+			err = r.WriteProxy(upsConn)
+		} else {
+			// socks5 (or other tunnel) upstream: dialContext already establishes a
+			// direct TCP connection to the target host through the tunnel, so use
+			// r.Write() (origin-server format). Do NOT forward proxy credentials.
+			upsConn, err = h.dialContext(ctx, "tcp", r.URL.Host)
+			if err != nil {
+				return caddyhttp.Error(http.StatusBadGateway,
+					fmt.Errorf("failed to dial upstream: %v", err))
+			}
+			err = r.Write(upsConn)
 		}
-		err = r.Write(upsConn)
 		if err != nil {
 			return caddyhttp.Error(http.StatusBadGateway,
 				fmt.Errorf("failed to write upstream request: %v", err))
