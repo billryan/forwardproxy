@@ -351,6 +351,47 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		// before attempting to connect to origin to reduce response latency.
 		// We merely close the connection if Open fails.
 
+		hostPort := r.URL.Host
+		if hostPort == "" {
+			hostPort = r.Host
+		}
+
+		// When using an upstream proxy, connect first so we can propagate
+		// the upstream's error code (e.g. 407) to the client instead of
+		// blindly replying 200 and closing the connection on failure.
+		if h.upstream != nil {
+			targetConn, err := h.dialContextCheckACL(ctx, "tcp", hostPort)
+			if err != nil {
+				return err
+			}
+			if targetConn == nil {
+				return caddyhttp.Error(http.StatusForbidden,
+					fmt.Errorf("hostname %s is not allowed", r.URL.Hostname()))
+			}
+			defer targetConn.Close()
+
+			w.WriteHeader(http.StatusOK)
+			flushErr := http.NewResponseController(w).Flush()
+			if flushErr != nil {
+				return caddyhttp.Error(http.StatusInternalServerError,
+					fmt.Errorf("ResponseWriter flush error: %v", flushErr))
+			}
+
+			switch r.ProtoMajor {
+			case 1:
+				return serveHijack(w, targetConn)
+			case 2:
+				fallthrough
+			case 3:
+				defer r.Body.Close()
+				return dualStream(targetConn, r.Body, w, false)
+			default:
+				return caddyhttp.Error(http.StatusBadRequest,
+					fmt.Errorf("unsupported HTTP major version: %d", r.ProtoMajor))
+			}
+		}
+
+		// No upstream: use Fast Open — reply 200 first, then connect.
 		// Creates a padding header with length in [30, 30+32)
 		paddingLen := rand.Intn(32) + 30
 		padding := make([]byte, paddingLen)
@@ -372,10 +413,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 				fmt.Errorf("ResponseWriter flush error: %v", err))
 		}
 
-		hostPort := r.URL.Host
-		if hostPort == "" {
-			hostPort = r.Host
-		}
 		targetConn, err := h.dialContextCheckACL(ctx, "tcp", hostPort)
 		if err != nil {
 			return err
@@ -586,7 +623,11 @@ func (h Handler) dialContextCheckACL(ctx context.Context, network, hostPort stri
 		// if upstreaming -- do not resolve locally nor check acl
 		conn, err = h.dialContext(ctx, network, hostPort)
 		if err != nil {
-			// return conn, &proxyError{S: err.Error(), Code: http.StatusBadGateway}
+			// Preserve the upstream's HTTP status code (e.g. 407) if available
+			var proxyErr *httpclient.ProxyError
+			if errors.As(err, &proxyErr) {
+				return conn, caddyhttp.Error(proxyErr.StatusCode, err)
+			}
 			return conn, caddyhttp.Error(http.StatusBadGateway, err)
 		}
 		return conn, nil

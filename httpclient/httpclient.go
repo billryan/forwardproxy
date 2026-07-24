@@ -105,6 +105,17 @@ func (c *HTTPConnectDialer) Dial(network, address string) (net.Conn, error) {
 // Users of context.WithValue should define their own types for keys
 type ContextKeyHeader struct{}
 
+// ProxyError preserves the upstream proxy's HTTP status code so that the
+// caller can forward it (e.g. 407 Proxy Authentication Required) to the client.
+type ProxyError struct {
+	StatusCode int
+	Status     string
+}
+
+func (e *ProxyError) Error() string {
+	return "Proxy responded with non 200 code: " + e.Status
+}
+
 // ctx.Value will be inspected for optional ContextKeyHeader{} key, with `http.Header` value,
 // which will be added to outgoing request headers, overriding any colliding c.DefaultHeader
 func (c *HTTPConnectDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
@@ -138,7 +149,7 @@ func (c *HTTPConnectDialer) DialContext(ctx context.Context, network, address st
 
 		if resp.StatusCode != http.StatusOK {
 			_ = rawConn.Close()
-			return nil, errors.New("Proxy responded with non 200 code: " + resp.Status)
+			return nil, &ProxyError{StatusCode: resp.StatusCode, Status: resp.Status}
 		}
 		return NewHttp2Conn(rawConn, pw, resp.Body), nil
 	}
@@ -162,7 +173,7 @@ func (c *HTTPConnectDialer) DialContext(ctx context.Context, network, address st
 
 		if resp.StatusCode != http.StatusOK {
 			_ = rawConn.Close()
-			return nil, errors.New("Proxy responded with non 200 code: " + resp.Status)
+			return nil, &ProxyError{StatusCode: resp.StatusCode, Status: resp.Status}
 		}
 		return rawConn, nil
 	}
