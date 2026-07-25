@@ -65,6 +65,11 @@ type Handler struct {
 	// If true, the Via header will not be added.
 	HideVia bool `json:"hide_via,omitempty"`
 
+	// If true, the client's Proxy-Authorization header will not be forwarded
+	// to the upstream proxy. By default it is forwarded so that an upstream
+	// (e.g. v2ray http inbound) can authenticate the client itself.
+	HideProxyAuth bool `json:"hide_proxy_auth,omitempty"`
+
 	// If true, the strict check preventing HTTP upstreams will be disabled.
 	DisableInsecureUpstreamsCheck bool `json:"disable_insecure_upstreams_check,omitempty"`
 
@@ -102,6 +107,10 @@ type Handler struct {
 	// overridden dialContext allows us to redirect requests to upstream proxy
 	dialContext func(ctx context.Context, network, address string) (net.Conn, error)
 	upstream    *url.URL // address of upstream proxy
+
+	// for http/https upstreams: dial directly to the proxy server (not via CONNECT tunnel)
+	// used to forward plain HTTP requests with WriteProxy
+	upstreamHTTPDialContext func(ctx context.Context, network, address string) (net.Conn, error)
 
 	aclRules []aclRule
 
@@ -239,6 +248,34 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 				return upstreamDialer.Dial(network, address)
 			}
 		}
+
+		// For http/https upstreams, plain HTTP requests must be forwarded directly to the
+		// proxy server (not via a CONNECT tunnel). Save a dialer that connects to the proxy
+		// host so we can use r.WriteProxy() later.
+		switch h.upstream.Scheme {
+		case "http", "https":
+			proxyHost := h.upstream.Host
+			if h.upstream.Scheme == "http" && h.upstream.Port() == "" {
+				proxyHost = net.JoinHostPort(h.upstream.Hostname(), "80")
+			} else if h.upstream.Scheme == "https" && h.upstream.Port() == "" {
+				proxyHost = net.JoinHostPort(h.upstream.Hostname(), "443")
+			}
+			if h.upstream.Scheme == "https" {
+				tlsCfg := &tls.Config{ServerName: h.upstream.Hostname(), MinVersion: tls.VersionTLS12}
+				if isLocalhost(h.upstream.Hostname()) {
+					tlsCfg.InsecureSkipVerify = true // #nosec G402
+				}
+				h.upstreamHTTPDialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+					conn, err := tls.DialWithDialer(dialer, network, proxyHost, tlsCfg)
+					return conn, err
+				}
+			} else {
+				capturedHost := proxyHost
+				h.upstreamHTTPDialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+					return dialer.DialContext(ctx, network, capturedHost)
+				}
+			}
+		}
 	}
 
 	return nil
@@ -282,14 +319,23 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	}
 
 	ctx := context.Background()
+	ctxHeader := make(http.Header)
 	if !h.HideIP {
-		ctxHeader := make(http.Header)
 		for k, v := range r.Header {
 			if kL := strings.ToLower(k); kL == "forwarded" || kL == "x-forwarded-for" {
 				ctxHeader[k] = v
 			}
 		}
 		ctxHeader.Add("Forwarded", "for=\""+r.RemoteAddr+"\"")
+	}
+	// Forward the client's Proxy-Authorization to the upstream proxy (e.g. v2ray),
+	// so the upstream can authenticate the client itself.
+	if h.upstream != nil && !h.HideProxyAuth {
+		if pa := r.Header.Get("Proxy-Authorization"); pa != "" {
+			ctxHeader.Set("Proxy-Authorization", pa)
+		}
+	}
+	if len(ctxHeader) > 0 {
 		ctx = context.WithValue(ctx, httpclient.ContextKeyHeader{}, ctxHeader)
 	}
 
@@ -305,6 +351,47 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		// before attempting to connect to origin to reduce response latency.
 		// We merely close the connection if Open fails.
 
+		hostPort := r.URL.Host
+		if hostPort == "" {
+			hostPort = r.Host
+		}
+
+		// When using an upstream proxy, connect first so we can propagate
+		// the upstream's error code (e.g. 407) to the client instead of
+		// blindly replying 200 and closing the connection on failure.
+		if h.upstream != nil {
+			targetConn, err := h.dialContextCheckACL(ctx, "tcp", hostPort)
+			if err != nil {
+				return err
+			}
+			if targetConn == nil {
+				return caddyhttp.Error(http.StatusForbidden,
+					fmt.Errorf("hostname %s is not allowed", r.URL.Hostname()))
+			}
+			defer targetConn.Close()
+
+			w.WriteHeader(http.StatusOK)
+			flushErr := http.NewResponseController(w).Flush()
+			if flushErr != nil {
+				return caddyhttp.Error(http.StatusInternalServerError,
+					fmt.Errorf("ResponseWriter flush error: %v", flushErr))
+			}
+
+			switch r.ProtoMajor {
+			case 1:
+				return serveHijack(w, targetConn)
+			case 2:
+				fallthrough
+			case 3:
+				defer r.Body.Close()
+				return dualStream(targetConn, r.Body, w, false)
+			default:
+				return caddyhttp.Error(http.StatusBadRequest,
+					fmt.Errorf("unsupported HTTP major version: %d", r.ProtoMajor))
+			}
+		}
+
+		// No upstream: use Fast Open — reply 200 first, then connect.
 		// Creates a padding header with length in [30, 30+32)
 		paddingLen := rand.Intn(32) + 30
 		padding := make([]byte, paddingLen)
@@ -326,10 +413,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 				fmt.Errorf("ResponseWriter flush error: %v", err))
 		}
 
-		hostPort := r.URL.Host
-		if hostPort == "" {
-			hostPort = r.Host
-		}
 		targetConn, err := h.dialContextCheckACL(ctx, "tcp", hostPort)
 		if err != nil {
 			return err
@@ -369,6 +452,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	r.ProtoMinor = 1
 	r.RequestURI = ""
 
+	// Save the client's Proxy-Authorization before removeHopByHop strips it,
+	// so we can forward it to the upstream proxy (e.g. v2ray http inbound).
+	clientProxyAuth := r.Header.Get("Proxy-Authorization")
 	removeHopByHop(r.Header)
 
 	if !h.HideIP {
@@ -403,20 +489,39 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		// Upstream requests don't interact well with Transport: connections could always be
 		// reused, but Transport thinks they go to different Hosts, so it spawns tons of
 		// useless connections.
-		// Just use dialContext, which will multiplex via single connection, if http/2
-		if creds := h.upstream.User.String(); creds != "" {
-			// set upstream credentials for the request, if needed
-			r.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(creds)))
-		}
 		if r.URL.Port() == "" {
 			r.URL.Host = net.JoinHostPort(r.URL.Host, "80")
 		}
-		upsConn, err := h.dialContext(ctx, "tcp", r.URL.Host)
-		if err != nil {
-			return caddyhttp.Error(http.StatusBadGateway,
-				fmt.Errorf("failed to dial upstream: %v", err))
+
+		var upsConn net.Conn
+		if h.upstreamHTTPDialContext != nil {
+			// http/https upstream: connect directly to the proxy server and send
+			// the request with WriteProxy (full URL in request line), which is
+			// what an HTTP proxy expects for plain HTTP requests.
+			// Forward the client's Proxy-Authorization to the upstream, or fall
+			// back to credentials embedded in the upstream URL.
+			if !h.HideProxyAuth && clientProxyAuth != "" {
+				r.Header.Set("Proxy-Authorization", clientProxyAuth)
+			} else if creds := h.upstream.User.String(); creds != "" {
+				r.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(creds)))
+			}
+			upsConn, err = h.upstreamHTTPDialContext(ctx, "tcp", r.URL.Host)
+			if err != nil {
+				return caddyhttp.Error(http.StatusBadGateway,
+					fmt.Errorf("failed to dial upstream: %v", err))
+			}
+			err = r.WriteProxy(upsConn)
+		} else {
+			// socks5 (or other tunnel) upstream: dialContext already establishes a
+			// direct TCP connection to the target host through the tunnel, so use
+			// r.Write() (origin-server format). Do NOT forward proxy credentials.
+			upsConn, err = h.dialContext(ctx, "tcp", r.URL.Host)
+			if err != nil {
+				return caddyhttp.Error(http.StatusBadGateway,
+					fmt.Errorf("failed to dial upstream: %v", err))
+			}
+			err = r.Write(upsConn)
 		}
-		err = r.Write(upsConn)
 		if err != nil {
 			return caddyhttp.Error(http.StatusBadGateway,
 				fmt.Errorf("failed to write upstream request: %v", err))
@@ -518,7 +623,11 @@ func (h Handler) dialContextCheckACL(ctx context.Context, network, hostPort stri
 		// if upstreaming -- do not resolve locally nor check acl
 		conn, err = h.dialContext(ctx, network, hostPort)
 		if err != nil {
-			// return conn, &proxyError{S: err.Error(), Code: http.StatusBadGateway}
+			// Preserve the upstream's HTTP status code (e.g. 407) if available
+			var proxyErr *httpclient.ProxyError
+			if errors.As(err, &proxyErr) {
+				return conn, caddyhttp.Error(proxyErr.StatusCode, err)
+			}
 			return conn, caddyhttp.Error(http.StatusBadGateway, err)
 		}
 		return conn, nil
