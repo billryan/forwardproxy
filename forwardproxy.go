@@ -96,6 +96,13 @@ type Handler struct {
 	// Optionally configure an upstream proxy to use.
 	Upstream string `json:"upstream,omitempty"`
 
+	// ExtraHeaders are request headers added when forwarding to the upstream
+	// proxy. Only used when `upstream` is configured. Useful for tagging
+	// requests with a correlation id (e.g. an X-Request-Id / UUID), or for
+	// overriding headers such as User-Agent. Values may contain Caddy
+	// placeholders (e.g. {uuid}), which are evaluated per request.
+	ExtraHeaders http.Header `json:"extra_headers,omitempty"`
+
 	// Access control list.
 	ACL []ACLRule `json:"acl,omitempty"`
 
@@ -335,6 +342,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			ctxHeader.Set("Proxy-Authorization", pa)
 		}
 	}
+	// Forward configured extra headers to the upstream. This also covers the
+	// CONNECT tunnel case, where the actual request is opaque to us and only
+	// the handshake request (built by httpclient) reaches the upstream.
+	if h.upstream != nil {
+		h.applyExtraHeaders(ctxHeader, r)
+	}
 	if len(ctxHeader) > 0 {
 		ctx = context.WithValue(ctx, httpclient.ContextKeyHeader{}, ctxHeader)
 	}
@@ -464,6 +477,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	// https://tools.ietf.org/html/rfc7230#section-5.7.1
 	if !h.HideVia {
 		r.Header.Add("Via", strconv.Itoa(r.ProtoMajor)+"."+strconv.Itoa(r.ProtoMinor)+" caddy")
+	}
+
+	// Inject configured extra headers (e.g. X-Request-Id / UUID) when
+	// forwarding to an upstream proxy.
+	if h.upstream != nil {
+		h.applyExtraHeaders(r.Header, r)
 	}
 
 	var response *http.Response
@@ -887,6 +906,24 @@ func forwardResponse(w http.ResponseWriter, response *http.Response) error {
 	_, err := io.CopyBuffer(w, response.Body, buf)
 	bufferPool.Put(bufPtr)
 	return err
+}
+
+// applyExtraHeaders adds h.ExtraHeaders to dst, evaluating Caddy placeholders
+// (e.g. {uuid}) per request via the replacer. Used to tag or override headers
+// sent to the upstream proxy. It is a no-op when no extra headers are configured.
+func (h *Handler) applyExtraHeaders(dst http.Header, r *http.Request) {
+	if len(h.ExtraHeaders) == 0 {
+		return
+	}
+	repl, _ := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+	for k, vals := range h.ExtraHeaders {
+		for _, v := range vals {
+			if repl != nil {
+				v = repl.ReplaceAll(v, "")
+			}
+			dst.Set(k, v)
+		}
+	}
 }
 
 func removeHopByHop(header http.Header) {

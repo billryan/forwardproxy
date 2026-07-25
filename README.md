@@ -238,6 +238,22 @@ By default, forwardproxy will reuse connections by using Go's built-in connectio
 
   Default: no upstream proxy.
 
+- `header_up [field] [value]`  
+  Adds a request header that is forwarded to the upstream proxy. This is useful for tagging requests (e.g. a correlation id / UUID) or overriding headers such as `User-Agent`. The directive may be repeated to set multiple headers. Values may contain Caddy placeholders (e.g. `{uuid}`), which are evaluated per request.
+
+  Headers set here are injected into both the upstream CONNECT handshake (so they are visible for HTTPS targets as well) and the plain-HTTP forwarded request. This directive only takes effect when `upstream` is configured.
+
+  Example:
+  ```
+  forward_proxy {
+  	upstream https://user:password@extra-upstream-hop.com
+  	header_up X-Request-Id {uuid}
+  	header_up X-Proxy-Tag my-forwardproxy
+  }
+  ```
+
+  Default: no extra headers are added.
+
 ## Get forwardproxy
 ### Download prebuilt binary
 Binaries are at https://caddyserver.com/download  

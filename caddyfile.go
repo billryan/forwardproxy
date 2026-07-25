@@ -3,6 +3,7 @@ package forwardproxy
 import (
 	"encoding/base64"
 	"log"
+	"net/http"
 	"strconv"
 	"strings"
 
@@ -190,6 +191,18 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return d.Err("upstream directive specified more than once")
 			}
 			h.Upstream = args[0]
+
+		case "header_up":
+			args := d.RemainingArgs()
+			if len(args) < 2 {
+				return d.ArgErr()
+			}
+			if h.ExtraHeaders == nil {
+				h.ExtraHeaders = make(http.Header)
+			}
+			field := args[0]
+			value := strings.Join(args[1:], " ")
+			h.ExtraHeaders.Set(field, value)
 
 		case "acl":
 			for nesting := d.Nesting(); d.NextBlock(nesting); {
