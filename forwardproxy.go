@@ -35,6 +35,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -392,12 +393,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 
 			switch r.ProtoMajor {
 			case 1:
-				return serveHijack(w, targetConn)
+				return h.serveHijack(w, r, targetConn)
 			case 2:
 				fallthrough
 			case 3:
 				defer r.Body.Close()
-				return dualStream(targetConn, r.Body, w, false)
+				return h.dualStream(targetConn, r.Body, w, false, r)
 			default:
 				return caddyhttp.Error(http.StatusBadRequest,
 					fmt.Errorf("unsupported HTTP major version: %d", r.ProtoMajor))
@@ -440,12 +441,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 
 		switch r.ProtoMajor {
 		case 1: // http1: hijack the whole flow
-			return serveHijack(w, targetConn)
+			return h.serveHijack(w, r, targetConn)
 		case 2: // http2: keep reading from "request" and writing into same response
 			fallthrough
 		case 3:
 			defer r.Body.Close()
-			return dualStream(targetConn, r.Body, w, r.Header.Get("Padding") != "")
+			return h.dualStream(targetConn, r.Body, w, r.Header.Get("Padding") != "", r)
 		}
 
 		panic("There was a check for http version, yet it's incorrect")
@@ -754,9 +755,27 @@ func serveHiddenPage(w http.ResponseWriter, authErr error) error {
 	return nil
 }
 
+// userIDFromRequest returns the authenticated user id that forwardproxy's
+// basic-auth handling stored under the request replacer as "http.auth.user.id"
+// (the same value your Caddy access log reports as user_id). It returns an
+// empty string when auth is disabled or the request is unauthenticated, so the
+// tunnel log line stays consistent with the access log and your vector pipeline
+// can correlate the two by user_id.
+func userIDFromRequest(r *http.Request) string {
+	if repl, ok := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer); ok {
+		if v, ok := repl.Get("http.auth.user.id"); ok && v != nil {
+			if s, ok := v.(string); ok {
+				return s
+			}
+			return fmt.Sprintf("%v", v)
+		}
+	}
+	return ""
+}
+
 // Hijacks the connection from ResponseWriter, writes the response and proxies data between targetConn
 // and hijacked connection.
-func serveHijack(w http.ResponseWriter, targetConn net.Conn) error {
+func (h Handler) serveHijack(w http.ResponseWriter, r *http.Request, targetConn net.Conn) error {
 	w.WriteHeader(http.StatusOK)
 	clientConn, brw, err := http.NewResponseController(w).Hijack()
 	if err != nil {
@@ -776,7 +795,7 @@ func serveHijack(w http.ResponseWriter, targetConn net.Conn) error {
 			fmt.Errorf("failed to flush to client: %v", err))
 	}
 
-	return dualStream(targetConn, clientConn, clientConn, false)
+	return h.dualStream(targetConn, clientConn, clientConn, false, r)
 }
 
 const (
@@ -786,16 +805,23 @@ const (
 	NumFirstPaddings = 8
 )
 
-// Copies data target->clientReader and clientWriter->target, and flushes as needed
-// Returns when clientWriter-> target stream is done.
-// Caddy should finish writing target -> clientReader.
-func dualStream(target net.Conn, clientReader io.ReadCloser, clientWriter io.Writer, padding bool) error {
-	stream := func(w io.Writer, r io.Reader, paddingType int) error {
+// Copies data target->clientReader and clientWriter->target, and flushes as needed.
+// It also accounts for the number of bytes transferred in each direction and,
+// when a logger is provided, emits a single structured log line when the tunnel
+// closes. This is necessary because CONNECT tunnels are hijacked (HTTP/1.1) or
+// streamed over a raw connection, so their bytes bypass Caddy's access-log size
+// accounting entirely — leaving traffic stats (e.g. for video) severely undercounted.
+//
+// tx_bytes = client -> target (upload), rx_bytes = target -> client (download).
+func (h Handler) dualStream(target net.Conn, clientReader io.ReadCloser, clientWriter io.Writer, padding bool, r *http.Request) error {
+	var up, down int64
+	stream := func(w io.Writer, r io.Reader, paddingType int, counter *int64) error {
 		// copy bytes from r to w
 		bufPtr := bufferPool.Get().(*[]byte)
 		buf := *bufPtr
 		buf = buf[0:cap(buf)]
-		_, _err := flushingIoCopy(w, r, buf, paddingType)
+		n, _err := flushingIoCopy(w, r, buf, paddingType)
+		atomic.AddInt64(counter, n)
 		bufferPool.Put(bufPtr)
 
 		if cw, ok := w.(closeWriter); ok {
@@ -803,12 +829,40 @@ func dualStream(target net.Conn, clientReader io.ReadCloser, clientWriter io.Wri
 		}
 		return _err
 	}
+
+	uploadPadding, downloadPadding := NoPadding, NoPadding
 	if padding {
-		go stream(target, clientReader, RemovePadding)
-		return stream(clientWriter, target, AddPadding)
+		uploadPadding, downloadPadding = RemovePadding, AddPadding
 	}
-	go stream(target, clientReader, NoPadding) //nolint: errcheck
-	return stream(clientWriter, target, NoPadding)
+
+	uploadDone := make(chan struct{})
+	go func() {
+		_ = stream(target, clientReader, uploadPadding, &up) // client -> target (tx)
+		close(uploadDone)
+	}()
+	err := stream(clientWriter, target, downloadPadding, &down) // target -> client (rx)
+
+	// The download direction has finished (typically the target closed the
+	// connection). Proactively unblock the upload goroutine so we can collect an
+	// accurate byte count before returning. net.Conn.Close is safe to call again
+	// via the caller's deferred Close.
+	_ = clientReader.Close()
+	_ = target.Close()
+	<-uploadDone
+
+	if h.logger != nil {
+		host := r.URL.Host
+		if host == "" {
+			host = r.Host
+		}
+		h.logger.Info("tunnel closed",
+			zap.String("user_id", userIDFromRequest(r)),
+			zap.String("host", host),
+			zap.Int64("tx_bytes", atomic.LoadInt64(&up)),
+			zap.Int64("rx_bytes", atomic.LoadInt64(&down)),
+		)
+	}
+	return err
 }
 
 type closeWriter interface {
